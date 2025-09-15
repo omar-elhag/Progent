@@ -1,0 +1,579 @@
+import json
+import re
+import logging
+from typing import Dict, List, Optional, Any
+import aiohttp
+from .config import settings, get_model_config
+from .ai.ai_response_handler import AIResponseHandler
+from .langchain_agent import LangChainAgent
+from .ai.utils import (
+    RAG_AVAILABLE,
+    RAGService,
+)
+
+logger = logging.getLogger(__name__)
+
+class AIService:
+    """Handles AI model interactions and response generation."""
+    def __init__(self, initial_model_key: str, websocket_manager: Any):
+        self.websocket_manager = websocket_manager
+        self.langchain_agent = None
+        # Holds dynamic functions discovered per client_id
+        self.client_dynamic_functions = {}
+        # Initialize other optional services to None; they'll be set in initialize()
+        self.session = None
+        self.rag_service = None
+        # Set initial model
+        self.set_model(initial_model_key)
+    
+    async def initialize(self):
+        """Initialize the AI service"""
+        self.session = aiohttp.ClientSession()
+        
+        # Initialize the response handler
+        self.response_handler = AIResponseHandler(self.session)
+        
+        # Initialize LangChain agent
+        self.langchain_agent = LangChainAgent(self.current_model, self.websocket_manager)
+          # Initialize RAG service if available
+        if RAG_AVAILABLE and RAGService is not None and settings.ENABLE_RAG:
+            try:
+                self.rag_service = RAGService()
+                await self.rag_service.initialize()
+            except Exception as e:
+                logger.warning(f"Could not initialize RAG service: {e}")
+                self.rag_service = None
+        
+        logger.info(f"AI Service initialized with model: {self.current_model}")
+    
+    async def cleanup(self):
+        """Cleanup resources"""
+        if self.session:
+            await self.session.close()
+    
+    def set_model(self, model_key: str):
+        """Set the current AI model"""
+        if model_key in settings.AI_MODELS:
+            self.current_model = model_key
+            if self.langchain_agent:
+                self.langchain_agent.set_model(model_key)
+            logger.info(f"AI model changed to: {model_key}")
+        else:
+            raise ValueError(f"Unknown AI model: {model_key}")
+
+    async def generate_response(
+        self, 
+        user_message: str, 
+        conversation_history: List[Dict], 
+        arcgis_state: Dict,
+        client_id: str = None
+    ) -> Dict[str, Any]:
+        """Generate AI response with function calling support"""
+        try:
+            logger.info(f"Generating response for model: {self.current_model}")
+            logger.info(f"User message: {user_message[:100]}...")
+
+            # Pre-check: try to fetch model config early so we can provide clear feedback
+            try:
+                model_config = get_model_config(self.current_model)
+            except Exception as e:
+                # Model config couldn't be retrieved (likely missing API key or misconfiguration)
+                err_msg = str(e)
+                logger.warning(err_msg)
+                # Return a structured error so the caller can surface it to the user
+                return {
+                    "type": "error",
+                    "content": (
+                        f"{err_msg} — You can add the API key via the web UI (click the key icon in the header) "
+                        "or set the environment variable on the server."
+                    ),
+                    "model": self.current_model
+                }
+            
+            # Use LangChain agent for Gemini models (if agent has an LLM)
+            if self.current_model.startswith("GEMINI") and self.langchain_agent and self.langchain_agent.llm:
+                logger.info(f"Using LangChain agent for model: {self.current_model}")
+                
+                response = await self.langchain_agent.generate_response(
+                    user_message,
+                    conversation_history,
+                    arcgis_state,
+                    client_id
+                )
+                return {"type": "text", "content": response["output"], "model": self.current_model}
+            elif self.current_model.startswith("GEMINI"):
+                # We couldn't use the LangChain agent for Gemini; provide a helpful error
+                logger.warning(f"LangChain agent not available for Gemini model: {self.current_model}")
+                return {
+                    "type": "error",
+                    "content": (
+                        "Gemini API key is missing or invalid. You can get a free API key at https://aistudio.google.com/app/apikey "
+                        "and add it in the web UI (key icon) or set it on the server."
+                    ),
+                    "model": self.current_model
+                }
+
+            # Fallback to existing logic for other models
+            model_config = get_model_config(self.current_model)
+            logger.info(f"Model config retrieved for: {model_config.get('name', 'unknown')}")
+            
+            if self.response_handler and client_id:
+                self.response_handler.set_client_context(client_id, self)
+            
+            messages = self._prepare_messages(
+                user_message, 
+                conversation_history, 
+                arcgis_state,
+                client_id
+            )
+            logger.info(f"Messages prepared, count: {len(messages)}")
+            
+            response = None
+            if self.current_model.startswith("GPT"):
+                logger.info("Using OpenAI model")
+                response = await self.response_handler._generate_openai_response_with_functions(messages, model_config, user_message)
+            elif self.current_model.startswith("CLAUDE"):
+                logger.info("Using Claude model")
+                response = await self.response_handler._generate_claude_response_with_functions(messages, model_config, user_message)
+            else:
+                raise ValueError(f"Unsupported model: {self.current_model}")
+            
+            logger.info(f"AI generated response type: {response.get('type')}")
+            return response
+
+        except Exception as e:
+            logger.error(f"Error generating AI response: {str(e)}", exc_info=True)
+            return {
+                "type": "error",
+                "content": f"Error generating response: {str(e)}",
+                "model": self.current_model
+            }    
+            
+    def _prepare_messages(
+        self, 
+        user_message: str, 
+        conversation_history: List[Dict], 
+        arcgis_state: Dict,
+        client_id: str = None
+    ) -> List[Dict]:
+        """Prepare messages for AI model with function calling context"""
+        
+        # System prompt for function calling
+        system_prompt = self._get_function_calling_system_prompt(arcgis_state)
+        logger.info(f"Generated system prompt with {len(system_prompt)} characters for ArcGIS state: {len(str(arcgis_state))} characters")
+        
+        # Build message history
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add recent conversation history (excluding system messages, but preserving function calls)
+        for msg in conversation_history[-10:]:  # Last 10 messages
+            if msg["role"] != "system":
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+          # Ensure get_functions_declaration is always available in the conversation
+        # Check if it's already been declared in the conversation history
+        has_functions_declaration = False
+        for msg in messages:
+            content = msg.get("content", "")
+            # Check if the message contains the get_functions_declaration definition
+            if ("get_functions_declaration" in content and 
+                "Function Declaration:" in content and 
+                "function_ids" in content):
+                has_functions_declaration = True
+                break
+        
+        # Also check the conversation history for function declarations
+        if not has_functions_declaration:
+            for msg in conversation_history[-20:]:  # Check last 20 messages
+                content = msg.get("content", "")
+                if ("get_functions_declaration" in content and 
+                    "Function Declaration:" in content and 
+                    "function_ids" in content):
+                    has_functions_declaration = True
+                    break
+        
+        # If not found in history, add it as a system-provided function declaration
+        if not has_functions_declaration:
+            from .progent_functions import format_available_functions
+
+            functions_declaration_info = {
+                "role": "system",
+                "content": (
+                    "AVAILABLE FUNCTION: get_functions_declaration\n\n"
+                    "Function Declaration:\n"
+                    "{\n"
+                    "    \"name\": \"get_functions_declaration\",\n"
+                    f"    \"description\": \"Get function declarations for specific functions by their IDs from the available functions list. MAKE SURE TO SEND VALID IDs. AVAILABLE FUNCTIONS: {format_available_functions()}\",\n"
+                    "    \"parameters\": {\n"
+                    "        \"function_ids\": {\n"
+                    "            \"type\": \"array\",\n"
+                    "            \"description\": \"Array of function IDs (integers) to get declarations for\",\n"
+                    "            \"items\": { \"type\": \"integer\" }\n"
+                    "        }\n"
+                    "    },\n"
+                    "    \"required\": [\"function_ids\"]\n"
+                    "}\n\n"
+                    "This function is ALWAYS available to you. You can call it at any time to get declarations for other functions."
+                )
+            }
+            messages.append(functions_declaration_info)
+            logger.info("Added get_functions_declaration availability to conversation")
+        
+        # Add current user message (avoid duplicates)
+        if not messages or messages[-1]["content"] != user_message or messages[-1]["role"] != "user":
+            messages.append({"role": "user", "content": user_message})
+        
+        logger.info(f"Prepared {len(messages)} messages for AI model")
+        return messages
+
+    def _get_function_calling_system_prompt(self, arcgis_state: Dict) -> str:
+        """Get a simple system prompt for function-calling GIS agent (LangChain style)"""
+        simplified_state = self._simplify_arcgis_state(arcgis_state)
+        return (
+            "You are Progent, a helpful GIS assistant for ArcGIS Pro. "
+            "You can use available function calls to solve spatial and data analysis tasks. "
+            "Use the provided tools as needed to answer user questions or perform GIS operations. "
+            "IMPORTANT: Do NOT use markdown formatting, code blocks, or triple backticks (```) in your responses. Provide plain text answers only. "
+            f"Current ArcGIS Pro state: {json.dumps(simplified_state)}"
+        )
+
+    def _simplify_arcgis_state(self, state: Dict) -> Dict:
+        """Simplify ArcGIS state to reduce payload while keeping essential information"""
+        if not state:
+            return {}
+        
+        simplified = {}
+        
+        # Include basic project info
+        if "workspace" in state:
+            simplified["workspace"] = state["workspace"]
+        if "default_gdb" in state:
+            simplified["default_gdb"] = state["default_gdb"]
+        
+        # Simplify layer information - keep only essential fields
+        if "layers_info" in state:
+            simplified["layers"] = {}
+            for layer_name, layer_info in state["layers_info"].items():
+                fields = layer_info.get("fields", {})
+                if isinstance(fields, dict):
+                    field_list = [k for k in fields.keys() if k != 'error']
+                else:
+                    field_list = []
+                
+                layer_data = {
+                    "fields": field_list,
+                    "layer_type": layer_info.get("layer_type", "Unknown"),
+                    "data_type": layer_info.get("data_type", "Unknown")
+                }
+                
+                # Add type-specific information
+                if layer_info.get("data_type") == "Raster":
+                    layer_data["is_raster"] = True
+                elif layer_info.get("layer_type") == "FeatureLayer":
+                    layer_data["geometry_type"] = layer_info.get("geometry_type", "")
+                    layer_data["definition_query"] = layer_info.get("definition_query", "")
+                elif layer_info.get("layer_type") == "StandaloneTable" or layer_info.get("data_type") == "Table":
+                    layer_data["is_table"] = True
+                
+                simplified["layers"][layer_name] = layer_data
+        
+        # Include layer types
+        if "layer_types" in state:
+            simplified["layer_types"] = state["layer_types"]        
+        # Include basemap info
+        if "basemap" in state:
+            simplified["basemap"] = state["basemap"]
+        
+        return simplified
+
+    
+    def _get_model_identity(self) -> str:
+        """Get model-specific identity string"""
+        if self.current_model.startswith("GEMINI"):
+            return "Gemini AI (Google)"
+        elif self.current_model.startswith("GPT"):
+            return "GPT (OpenAI)"
+        elif self.current_model.startswith("CLAUDE"):
+            return "Claude (Anthropic)"
+        else:
+            return "AI Assistant"
+
+
+    def parse_function_call(self, function_call_str: str) -> Optional[Dict]:
+        """Parse a function call string into function name and parameters (DEPRECATED - use function calling instead)"""
+        try:
+            # Regex to capture function name and arguments
+            func_regex = r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)$'
+            func_match = re.match(func_regex, function_call_str.strip())
+            
+            if not func_match:
+                logger.error(f"Invalid function call format: {function_call_str}")
+                return None
+            
+            function_name = func_match.group(1)
+            args_string = func_match.group(2).strip()
+            
+            # Parse parameters
+            parameters = {}
+            if args_string:
+                parameters = self._parse_function_parameters(args_string)
+            
+            return {
+                "function_name": function_name,
+                "parameters": parameters
+            }
+            
+        except Exception as e:
+            logger.error(f"Error parsing function call {function_call_str}: {str(e)}")
+            return None
+    
+    def _parse_function_parameters(self, args_string: str) -> Dict:
+        """Parse function parameters from argument string (DEPRECATED - use function calling instead)"""
+        parameters = {}
+        
+        # Simple parameter parsing - handles key=value pairs
+        arg_pairs = []
+        current_pair = ""
+        in_quotes = False
+        quote_char = None
+        
+        for char in args_string:
+            if char in ['"', "'"] and (not in_quotes or char == quote_char):
+                if not in_quotes:
+                    in_quotes = True
+                    quote_char = char
+                elif char == quote_char:
+                    in_quotes = False
+                    quote_char = None
+            
+            if char == ',' and not in_quotes:
+                arg_pairs.append(current_pair.strip())
+                current_pair = ""
+            else:
+                current_pair += char
+        
+        if current_pair.strip():
+            arg_pairs.append(current_pair.strip())
+        
+        # Parse each parameter
+        for pair in arg_pairs:
+            if '=' in pair:
+                key, value = pair.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Remove quotes if present
+                if (value.startswith('"') and value.endswith('"')) or \
+                   (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                
+                # Convert to appropriate type
+                if value.lower() == 'true':
+                    value = True
+                elif value.lower() == 'false':
+                    value = False
+                elif value.lower() == 'none':
+                    value = None
+                elif value.replace('.', '').replace('-', '').isdigit():
+                    value = float(value) if '.' in value else int(value)
+                
+                parameters[key] = value
+        
+        return parameters
+    
+    async def generate_investigation_summary(self, session: Dict) -> str:
+        """Generate final response after investigation session (DEPRECATED - use function calling instead)"""
+        try:
+            # Prepare context from investigation steps
+            investigation_context = "Investigation Results:\n"
+            for step in session.get("steps", []):
+                if "data" in step:
+                    investigation_context += f"- {json.dumps(step['data'])}\n"
+            
+            # Generate summary using AI
+            messages = [
+                {
+                    "role": "system", 
+                    "content": "Based on the investigation results below, provide a comprehensive and helpful summary for the user. Focus on key insights and actionable information."
+                },
+                {
+                    "role": "user", 
+                    "content": investigation_context
+                }
+            ]
+            
+            model_config = get_model_config(self.current_model)
+              # Use legacy methods for backward compatibility
+            if self.current_model.startswith("GEMINI"):
+                return await self._generate_gemini_response_legacy(messages, model_config)
+            elif self.current_model.startswith("GPT"):
+                return await self._generate_openai_response_legacy(messages, model_config)
+            elif self.current_model.startswith("CLAUDE"):
+                return await self._generate_claude_response_legacy(messages, model_config)
+            else:
+                # Fallback - simple summary
+                return f"Investigation completed with {len(session.get('steps', []))} steps. Please check the results above."
+                
+        except Exception as e:
+            logger.error(f"Error generating investigation summary: {str(e)}")
+            return "Investigation completed, but I encountered an error while summarizing the results. Please review the individual steps above."
+    
+    # Legacy response methods (without function calling)
+    
+    async def _generate_gemini_response_legacy(self, messages: List[Dict], model_config: Dict) -> str:
+        """Generate response using Gemini API (legacy method without function calling)"""
+        try:
+            # Convert messages to Gemini format
+            contents = []
+            for msg in messages:
+                role = "user" if msg["role"] == "user" else "model"
+                contents.append({
+                    "role": role,
+                    "parts": [{"text": msg["content"]}]
+                })
+            
+            payload = {
+                "contents": contents,
+                "generationConfig": {
+                    "temperature": model_config["temperature"],
+                    "maxOutputTokens": model_config["max_tokens"]
+                }
+            }
+            
+            url = f"{model_config['endpoint']}?key={model_config['api_key']}"
+            
+            if self.session is None:
+                raise RuntimeError("aiohttp ClientSession is not initialized. Call 'await initialize()' before making requests.")
+            async with self.session.post(url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"Gemini API error {response.status}: {error_text}")
+                    
+        except Exception as e:
+            logger.error(f"Error calling Gemini API: {str(e)}")
+            raise
+    
+    async def _generate_openai_response_legacy(self, messages: List[Dict], model_config: Dict) -> str:
+        """Generate response using OpenAI API (legacy method without function calling)"""
+        try:
+            payload = {
+                "model": model_config.get("model", "gpt-4"),
+                "messages": messages,
+                "temperature": model_config["temperature"],
+                "max_tokens": model_config["max_tokens"]
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {model_config['api_key']}",
+                "Content-Type": "application/json"
+            }
+            
+            if self.session is None:
+                raise RuntimeError("aiohttp ClientSession is not initialized. Call 'await initialize()' before making requests.")
+            async with self.session.post(model_config["endpoint"], json=payload, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data["choices"][0]["message"]["content"]
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"OpenAI API error {response.status}: {error_text}")
+                    
+        except Exception as e:
+            logger.error(f"Error calling OpenAI API: {str(e)}")
+            raise
+    
+    async def _generate_claude_response_legacy(self, messages: List[Dict], model_config: Dict) -> str:
+        """Generate response using Claude API (legacy method without function calling)"""
+        try:
+            # Claude API format is different - system message separate
+            system_message = ""
+            claude_messages = []
+            
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_message = msg["content"]
+                else:
+                    claude_messages.append(msg)
+            
+            payload = {
+                "model": model_config.get("model", "claude-3-5-sonnet-20241022"),
+                "system": system_message,
+                "messages": claude_messages,
+                "temperature": model_config["temperature"],
+                "max_tokens": model_config["max_tokens"]
+            }
+            
+            headers = {
+                "x-api-key": model_config['api_key'],
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01"
+            }
+            
+            if self.session is None:
+                raise RuntimeError("aiohttp ClientSession is not initialized. Call 'await initialize()' before making requests.")
+            async with self.session.post(model_config["endpoint"], json=payload, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data["content"][0]["text"]
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"Claude API error {response.status}: {error_text}")
+        except Exception as e:
+            logger.error(f"Error calling Claude API: {str(e)}")
+            raise
+
+    
+    async def handle_function_response(
+        self,
+        messages: List[Dict],
+        function_results: List[Dict]
+    ) -> Dict[str, Any]:
+        """Handle function execution results and get final AI response (cleaned for agent mode)"""
+        if not self.response_handler:
+            raise RuntimeError("Response handler not initialized")
+
+        # Log to verify system prompt is included
+        system_message = next((msg for msg in messages if msg.get("role") == "system"), None)
+        if system_message:
+            logger.info(f"System prompt included in function response handling: {len(system_message['content'])} characters")
+        else:
+            logger.warning("No system prompt found in function response messages!")
+
+        # Update the response handler with current model info
+        self.response_handler.current_model = self.current_model
+
+        # No more extra system messages for agent mode
+        logger.info(f"Processing {len(function_results)} function results in handle_function_response (agent mode, no extra system messages)")
+        return await self.response_handler.handle_function_response(messages, function_results)
+
+    def add_dynamic_functions_for_client(self, client_id: str, discovered_functions: Dict):
+        """Add dynamically discovered functions for a specific client"""
+        if client_id not in self.client_dynamic_functions:
+            self.client_dynamic_functions[client_id] = {}
+        
+        self.client_dynamic_functions[client_id].update(discovered_functions)
+        logger.info(f"Added {len(discovered_functions)} dynamic functions for client {client_id}")
+    
+    def get_available_functions_for_client(self, client_id: str) -> Dict:
+        """Get all available functions (base + dynamic) for a specific client"""
+        from .function_declaration_generator import function_declarations
+        
+        # Start with base functions (just get_functions_declaration)
+        available_functions = function_declarations._function_definitions.copy()
+        
+        # Add any dynamically discovered functions for this client
+        if client_id in self.client_dynamic_functions:
+            available_functions.update(self.client_dynamic_functions[client_id])
+        
+        return available_functions
+    
+    def clear_dynamic_functions_for_client(self, client_id: str):
+        """Clear dynamic functions for a client (e.g., when conversation ends)"""
+        if client_id in self.client_dynamic_functions:
+            del self.client_dynamic_functions[client_id]
+            logger.info(f"Cleared dynamic functions for client {client_id}")

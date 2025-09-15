@@ -1,0 +1,52 @@
+# Repository .gitignore: project files live under `Progent/`.
+
+# Logs (kept under Progent/)
+Progent/logs/
+*.log
+
+# Python cache and compiled files (only keep Progent-scoped caches to avoid duplicates)
+Progent/**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment files (Progent/ subtree)
+Progent/.env
+Progent/.venv
+Progent/env/
+Progent/venv/
+Progent/venv_backup/
+
+# Project specific (Progent/)
+Progent/.history/
+Progent/rag_db/
+Progent/environment_info.txt
+Progent/activate_environment.bat
+Progent/connect_arcgis.bat
+
+# ArcGIS specific
+*.aprx.lock
+*.tbx.lock
+
+# IDE and editor files (Progent/)
+Progent/.vscode/
+Progent/.idea/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# AddIn build artifacts (inside Progent/AddIn)
+Progent/AddIn/bin/
+Progent/AddIn/.vs/
+Progent/AddIn/obj/
+
+# If you prefer to keep a separate .gitignore inside Progent/, add it and remove
+# the Progent-specific entries above. We currently maintain ignores at the repo root.

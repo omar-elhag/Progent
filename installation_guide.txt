@@ -1,0 +1,20 @@
+Progent Installation Guide
+========================
+
+1. Run `setup_environment.bat` to set up the Python environment.
+   - You may close when setup is complete.
+
+2. Start the server by running `start_server.bat`.
+   - Keep this window open. The server will run as long as this window is open.
+
+3. Install the ArcGIS Pro add-in:
+   - Choose the add-in corresponding to your ArcGIS Pro version:
+     - For ArcGIS Pro 3.2, double-click `Progent_arcgis_3.2.esriAddinX`.
+     - For ArcGIS Pro 3.4, double-click `Progent_arcgis_3.4.esriAddinX`.
+
+4. In ArcGIS Pro:
+   - Go to the "AI Assistant" tab.
+   - Open the "Progent" panel.
+   - Click the "Connect" button to link to the running server.
+
+You are now ready to use Progent in ArcGIS Pro.
